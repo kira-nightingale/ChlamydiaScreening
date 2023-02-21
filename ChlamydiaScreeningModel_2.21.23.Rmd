@@ -1,0 +1,425 @@
+---
+title: "ChlamydiaScreeningModel_9.28.22"
+output: html_document
+date: '2022-09-028'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Setting up working environment
+```{r}
+library(EpiModel)
+library(network)
+
+```
+
+##OVERALL GOAL:
+#Creating a network model for a US high school
+#Using data Admiraal and Handcock: https://projecteuclid-org.proxy.library.upenn.edu/journals/annals-of-applied-statistics/volume-10/issue-4/Modeling-concurrency-and-selective-mixing-in-heterosexual-partnership-networks-with/10.1214/16-AOAS963.full
+
+
+#Most basic model - population of 2000 with no race/sex specific parameters
+```{r}
+set.seed(3972)
+
+##BASIC MODEL - no specification of sex or race
+#Assume population of 2000
+
+num.g1 <- num.g2 <- 1000
+nw <- network_initialize(n = num.g1 + num.g2)
+nw
+
+##Degree Distributions - Population size of 2000
+#Degree     Black Males   White Males   Black Females   White Females
+#0              80            320           80              320
+#1              100           400           100             400
+#2              12            48            12              48
+#3              6             24            6               24
+#4              2             8             2               8
+#Pop Size       200           800           200             800
+
+#Mean degree = 0.75
+
+##SIMPLE MODEL - only includes specification of number of degree 0 individuals and number of concurrent partnerships. No specification of sex or racial mixing.
+formation <- ~edges + degree(0) + concurrent
+
+#Edges target stat = 2000*0.75/2 = 750
+
+target.stats <- c(750, 800, 200)
+
+#Dissolution - paper says average relationship is 4 months, scale models in days
+coef.diss <- dissolution_coefs(dissolution = ~offset(edges), duration = 120)
+
+est <- netest(nw, formation, target.stats, coef.diss)
+
+#Network diagnostics - 10 simulations, 4 years (1460 days)
+dx <- netdx(est, nsims = 10, nsteps = 1460, ncores = 16, nwstats.formula = ~edges + degree(0) + concurrent)
+dx
+plot(dx)
+
+```
+
+
+#Slightly more complicated model - sex-specific parameters included, assuming only white adolescents using paper's reported degree distributions
+```{r}
+set.seed(3972)
+
+#Assume population of 2000, 50% males 50% females
+num1 <- num2 <- 1000
+n <- 2000
+nw <- network_initialize(n = num1 + num2)
+nw <- set_vertex_attribute(nw, "group", rep(1:2, c(num1, num2)))
+
+statusVec <- rep("s", n)
+init.latent <- sample(1:n, 50)
+statusVec[init.latent] <- "e"
+
+statusTime <- rep(NA, n)
+statusTime[which(statusVec == "e")] <- 1
+
+symptomatic <- rep(NA, n)
+
+nw <- set_vertex_attribute(nw, "status", statusVec)
+nw <- set_vertex_attribute(nw, "statusTime", statusTime)
+nw <- set_vertex_attribute(nw, "symptomatic", symptomatic)
+nw
+
+##Degree Distributions - Population size of 2000
+#Degree        Males        Females
+#0              382           345
+#1              566           630
+#2              40            23
+#3              12            2
+#Pop Size       682           682
+
+#Mean degree = 0.682
+
+#Setting degree distributions for female (g1) and males (g2). Using degree 0-3 based on reported relationships resulted in unbalanced edges. Tweaked female degree 0, 1, and 2 to end up with equal edges between males and females.
+deg.dist.g1 <- c(0.345, 0.63, 0.023, 0.002)
+deg.dist.g2 <- c(0.382, 0.566, 0.040, 0.012)
+
+check_degdist_bal(num1, num2, deg.dist.g1, deg.dist.g2)
+
+
+##Formation of model
+formation <- ~edges + degree(0:3, by="group") + nodematch("group")
+
+#Edges target stat = 2000*0.682/2 = 682
+
+target.stats <- c(682, 345, 630, 23, 2, 382, 566, 40, 12, 0)
+
+#Dissolution - paper says average relationship is 4 months, scale models in days
+coef.diss <- dissolution_coefs(dissolution = ~offset(edges), duration = 120)
+
+est <- netest(nw, formation, target.stats, coef.diss)
+
+dx <- netdx(est, nsims = 10, nsteps = 1460, ncores = 16, nwstats.formula = ~ edges + degree(0:3, by="group") + nodematch("group"))
+dx
+plot(dx)
+
+```
+
+#Setting disease parameters
+#Davies et al. Theoretical Biology and Medical Modelling 2014, 11:8
+```{r}
+#
+param <- param.net(inf.prob = 0.095, inf.prob.g2 = 0.095, act.rate = 2, rec.rate = 0.1, rec.rate.g2 = 0.1)
+
+#10 infected males, 10 infected females
+init <- init.net(i.num = 10, i.num.g2 = 10)
+
+#SIS model lasting 1460 days, 10 simulations
+control <- control.net(type = "SIS", nsims = 10, nsteps = 1460)
+
+sim <- netsim(est, param, init, control)
+sim
+
+plot(sim, type = "network", col.status = TRUE, at = 1, sims = 1)
+
+#Run one simulation at a time
+
+```
+
+
+#Customizing base SEIR model to include additional compartments
+```{r}
+##Customizing compartment flow
+
+
+#S = Susceptible
+#E = Exposed, not infectious
+#Ia = Infected, asymptomatic
+#Is = Infected, symptomatic
+#R = Recovered (temporarily immune)
+
+progress2 <- function(dat, at) {
+
+  ## Attributes
+  active <- get_attr(dat, "active")
+  status <- get_attr(dat, "status")
+  statusTime <- get_attr(dat, "statusTime")
+  symptomatic <- get_attr(dat, "symptomatic")
+
+  ## Parameters
+  prop.sympt <- get_param(dat, "prop.sympt")
+  eis.rate <- get_param(dat, "eis.rate")
+  iss.rate <- get_param(dat, "iss.rate")
+  eia.rate <- get_param(dat, "eia.rate")
+  iar.rate <- get_param(dat, "iar.rate")
+  rs.rate <- get_param(dat, "rs.rate")
+  ias.rate <- get_param(dat, "ias.rate")
+
+  ## Determine Symptomatic (E to Is) or Asymptomatic (E to Ia) pathway
+  ids.newInf <- which(active == 1 & status == "E" & statusTime <= at & is.na(symptomatic))
+  num.newInf <- length(ids.newInf)
+  if (num.newInf > 0) {
+    prop.sympt.vec <- prop.sympt
+    vec.new.sympt <- rbinom(num.newInf, 1, prop.sympt.vec)
+    sympt[ids.newInf] <- vec.new.sympt
+  }
+
+  
+  ## Asymptomatic Pathway
+  # E to Ia: latent move to asymptomatic infectious
+  num.new.EtoIa <- 0
+  ids.Eia <- which(active == 1 & status == "E" & statusTime < at & symptomatic == 0)
+  num.Eia <- length(ids.Eia)
+  if (num.Eia > 0) {
+    vec.new.Ia <- which(rbinom(num.Eia, 1, eia.rate) == 1)
+    if (length(vec.new.Ia) > 0) {
+      ids.new.Ia <- ids.Eia[vec.new.Ia]
+      num.new.EtoIa <- length(ids.new.Ia)
+      status[ids.new.Ia] <- "Ia"
+      statusTime[ids.new.Ia] <- at
+    }
+  }
+
+  # Ia to R: asymptomatic infectious move to recovered (temporarily immune)
+  num.new.IatoR <- 0
+  ids.Ia <- which(active == 1 & status == "Ia" & statusTime < at & symptomatic == 0)
+  num.Ia <- length(ids.Ia)
+  if (num.Ia > 0) {
+    vec.new.R <- which(rbinom(num.Ia, 1, iar.rate) == 1)
+    if (length(vec.new.R) > 0) {
+      ids.new.R <- ids.Ia[vec.new.R]
+      num.new.IatoR <- length(ids.new.R)
+      status[ids.new.R] <- "R"
+      statusTime[ids.new.R] <- at
+    }
+  }
+  
+  # R to S: recovered (temporarily immune) to susceptible
+  num.new.RtoS <- 0
+  ids.R <- which(active == 1 & status == "R" & statusTime < at & symptomatic == 0)
+  num.R <- length(ids.R)
+  if (num.R > 0) {
+    vec.new.S <- which(rbinom(num.R, 1, rs.rate) == 1)
+    if (length(vec.new.R) > 0) {
+      ids.new.S <- ids.R[vec.new.S]
+      num.new.RtoS <- length(ids.new.S)
+      status[ids.new.S] <- "S"
+      statusTime[ids.new.S] <- at
+    }
+  }
+  
+    # Ia to S: Asymptomatic to susceptible (identified through screening)
+  num.new.IatoS <- 0
+  ids.Ia <- which(active == 1 & status == "Ia" & statusTime < at & symptomatic == 0)
+  num.Ia <- length(ids.Ia)
+  if (num.Ia > 0) {
+    vec.new.S <- which(rbinom(num.Ia, 1, ias.rate) == 1)
+    if (length(vec.new.R) > 0) {
+      ids.new.S <- ids.R[vec.new.S]
+      num.new.RtoS <- length(ids.new.S)
+      status[ids.new.S] <- "S"
+      statusTime[ids.new.S] <- at
+    }
+  }
+
+  ## Symptomatic Pathway
+  # E to Is: latent move to symptomatic infectious
+  num.new.EtoIs <- 0
+  ids.Eis <- which(active == 1 & status == "E" & statusTime < at & symptomatic == 1)
+  num.Eis <- length(ids.Eis)
+  if (num.Eis > 0) {
+    vec.new.Is <- which(rbinom(num.Eis, 1, eis.rate) == 1)
+    if (length(vec.new.Is) > 0) {
+      ids.new.Is <- ids.Eis[vec.new.Is]
+      num.new.EtoIs <- length(ids.new.Is)
+      status[ids.new.Is] <- "Is"
+      statusTime[ids.new.Is] <- at
+    }
+  }
+
+  # Is to S: Symptomatic infectious move to susceptible
+  num.new.IstoS <- 0
+  ids.Is <- which(active == 1 & status == "Is" & statusTime < at & symptomatic == 1)
+  num.Is <- length(ids.Is)
+  if (num.Is > 0) {
+    vec.new.Is <- which(rbinom(num.Is, 1, iss.rate) == 1)
+    if (length(vec.new.S) > 0) {
+      ids.new.S <- ids.Is[vec.new.S]
+      num.new.IstoS <- length(ids.new.S)
+      status[ids.new.S] <- "S"
+      statusTime[ids.new.S] <- at
+    }
+  }
+
+  
+  ## Save updated status attribute
+  dat <- set_attr(dat, "status", status)
+  dat <- set_attr(dat, "statusTime", statusTime)
+  dat <- set_attr(dat, "symptomatic", symptomatic)
+
+  ## Save summary statistics
+  dat <- set_epi(dat, "eis.flow", at, num.new.EtoIs)
+  dat <- set_epi(dat, "iss.flow", at, num.new.IstoS)
+  dat <- set_epi(dat, "eia.flow", at, num.new.EtoIa)
+  dat <- set_epi(dat, "iar.flow", at, num.new.IatoR)
+  dat <- set_epi(dat, "rs.flow", at, num.new.RtoS)
+  dat <- set_epi(dat, "ias.flow", at, num.new.IatoS)
+
+  dat <- set_epi(dat, "e.num", at, sum(status == "e"))
+  dat <- set_epi(dat, "Is.num", at, sum(status == "is"))
+  dat <- set_epi(dat, "s.num", at, sum(status == "s"))
+  dat <- set_epi(dat, "Ia.num", at, sum(status == "ia"))
+  dat <- set_epi(dat, "r.num", at, sum(status == "r"))
+
+  return(dat)
+}
+  
+
+##Customizing infection module
+infect2 <- function(dat, at) {
+
+  ## Attributes ##
+  active <- get_attr(dat, "active")
+  status <- get_attr(dat, "status")
+  infTime <- get_attr(dat, "infTime")
+  statusTime <- get_attr(dat, "statusTime")
+
+  ## Parameters ##
+  inf.prob <- get_param(dat, "inf.prob")
+  act.rate <- get_param(dat, "act.rate")
+  inf.prob.sympt.rr <- get_param(dat, "inf.prob.sympt.rr")
+  act.rate.dx.sympt.time <- get_param(dat, "act.rate.dx.sympt.time")
+  act.rate.dx.sympt.rr <- get_param(dat, "act.rate.dx.sympt.rr")
+
+  ## Find infected nodes ##
+  infstat <- c("Ia", "Is")
+  idsInf <- which(active == 1 & status %in% infstat)
+  nActive <- sum(active == 1)
+  nElig <- length(idsInf)
+
+  ## Initialize default incidence at 0 ##
+  nInf <- 0
+
+  ## If any infected nodes, proceed with transmission ##
+  if (nElig > 0 && nElig < nActive) {
+
+    ## Look up discordant edgelist ##
+    del <- discord_edgelist(dat, at, infstat = infstat)
+
+    ## If any discordant pairs, proceed ##
+    if (!(is.null(del))) {
+
+      del$status <- status[del$inf]
+
+      # Set parameters on discordant edgelist data frame
+      del$transProb <- inf.prob
+      del$transProb[del$status == "Is"] <- del$transProb[del$status == "Is"] *
+                                          inf.prob.sympt.rr
+      del$actRate <- act.rate
+      if (at >= act.rate.dx.sympt.time) {
+        del$actRate[del$dxStatus == 2] <- del$actRate[del$dxStatus == 2] *
+                                          act.rate.dx.sympt.rr
+      }
+      del$finalProb <- 1 - (1 - del$transProb)^del$actRate
+
+      # Stochastic transmission process
+      transmit <- rbinom(nrow(del), 1, del$finalProb)
+
+      # Keep rows where transmission occurred
+      del <- del[which(transmit == 1), ]
+
+      # Look up new ids if any transmissions occurred
+      idsNewInf <- unique(del$sus)
+      nInf <- length(idsNewInf)
+
+      # Set new attributes and transmission matrix
+      if (nInf > 0) {
+        status[idsNewInf] <- "e"
+        infTime[idsNewInf] <- at
+        statusTime[idsNewInf] <- at
+        dat <- set_transmat(dat, del, at)
+      }
+    }
+  }
+
+  dat <- set_attr(dat, "status", status)
+  dat <- set_attr(dat, "infTime", infTime)
+  dat <- set_attr(dat, "statusTime", statusTime)
+
+  ## Save summary statistics
+  dat <- set_epi(dat, "se.flow", at, nInf)
+
+  return(dat)
+}
+
+
+```
+
+#Setting infection parameters
+```{r}
+param <- param.net(inf.prob = 0.1,
+                   act.rate = 3,
+                   inf.prob.sympt.rr = 0.5,
+                   act.rate.dx.sympt.time = Inf,
+                   act.rate.dx.sympt.rr = 0.05,
+                   eis.rate = 1/4.0,
+                   iss.rate = 1/5.0,
+                   eia.rate = 1/4.0,
+                   iar.rate = 1/1.5,
+                   rs.rate = 1/3.5,
+                   ias.rate = 1/2.5,
+                   prop.sympt = 0.85)
+init <- init.net(i.num = 10, i.num.g2 = 10)
+
+```
+
+```{r}
+control <- control.net(type = NULL,
+                       nsims = 10,
+                       ncores = 5,
+                       nsteps = 100,
+                       infection.FUN = infect2,
+                       progress.FUN = progress2,
+                       resimulate.network = TRUE,
+                       tergmLite = TRUE,
+                       set.control.tergm = 
+                         control.simulate.formula.tergm(MCMC.burnin.min = 10000))
+
+sim <- netsim(est, param, init, control)
+sim
+
+
+plot(sim)
+
+```
+
+
+
+
+#Random disease parameters just to plot network
+#param <- param.net(inf.prob = 0.4, inf.prob.g2 = 0.2, act.rate = 2, rec.rate = 0.1, rec.rate.g2 = 0.1)
+#init <- init.net(i.num = 10, i.num.g2 = 10)
+#control <- control.net(type = "SIS", nsims = 5, nsteps = 1460)
+
+#sim <- netsim(est, param, init, control)
+
+#plot(sim, type = "network", col.status = TRUE, at = 1, sims = 1)
+
+```
+
